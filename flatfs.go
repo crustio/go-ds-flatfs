@@ -787,7 +787,7 @@ func (fs *Datastore) GetSize(key datastore.Key) (size int, err error) {
 
 	if ok, si := crust.TryGetSealedInfo(value); ok {
 		if len(si.Sbs) == 0 {
-			return 0, fmt.Errorf("Sbs is empty, can't get block size")
+			return -1, datastore.ErrNotFound
 		}
 		return si.Sbs[0].Size, nil
 	}
