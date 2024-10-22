@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/crustio/go-ipfs-encryptor/crust"
 	"math"
 	"math/rand"
 	"os"
@@ -408,12 +409,62 @@ func (fs *Datastore) Put(ctx context.Context, key datastore.Key, value []byte) e
 		return ErrClosed
 	}
 
+	if ok, sb := crust.TryGetSealedBlock(value); ok {
+		// fmt.Printf("Sb: {path: %s, size: %d}\n", sb.Path, sb.Size)
+		data, err := fs.GetRaw(key)
+		if err == datastore.ErrNotFound {
+			_, err := fs.doWriteOp(&op{
+				typ: opPut,
+				key: key,
+				v:   sb.ToSealedInfo().Bytes(),
+			})
+			return err
+		} else if err != nil {
+			return err
+		}
+		if ok, si := crust.TryGetSealedInfo(data); !ok {
+			_, err := fs.doWriteOp(&op{
+				typ: opPut,
+				key: key,
+				v:   sb.ToSealedInfo().Bytes(),
+			})
+			return err
+		} else {
+			// for i := 0; i < len(si.Sbs); i++ {
+			// fmt.Printf("Sbs[%d]: {path: %s, size: %d}\n", i, si.Sbs[i].Path, si.Sbs[i].Size)
+			// }
+			_, err := fs.doWriteOp(&op{
+				typ: opPut,
+				key: key,
+				v:   si.AddSealedBlock(*sb).Bytes(),
+			})
+			return err
+		}
+	}
+
 	_, err := fs.doWriteOp(&op{
 		typ: opPut,
 		key: key,
 		v:   value,
 	})
 	return err
+}
+
+func (fs *Datastore) GetRaw(key datastore.Key) (value []byte, err error) {
+	// Can't exist in datastore.
+	if !keyIsValid(key) {
+		return nil, datastore.ErrNotFound
+	}
+	_, path := fs.encode(key)
+	data, err := readFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, datastore.ErrNotFound
+		}
+		// no specific error to return, so just pass it through
+		return nil, err
+	}
+	return data, nil
 }
 
 func (fs *Datastore) Sync(ctx context.Context, prefix datastore.Key) error {
@@ -663,6 +714,50 @@ func (fs *Datastore) Get(ctx context.Context, key datastore.Key) (value []byte, 
 		// no specific error to return, so just pass it through
 		return nil, err
 	}
+
+	if ok, si := crust.TryGetSealedInfo(data); ok {
+		sbsLen := len(si.Sbs)
+		if sbsLen == 0 {
+			return nil, datastore.ErrNotFound
+		}
+		rindex := rand.Intn(sbsLen)
+		var ret []byte
+		var code int
+		for i := rindex; i < len(si.Sbs)+rindex; {
+			nowi := i % len(si.Sbs)
+			ret, err, code = crust.Unseal(si.Sbs[nowi].Path)
+			if err != nil {
+				switch code {
+				case 200:
+					return ret, nil
+				// Can't find
+				case 404:
+					si.Sbs = append(si.Sbs[:nowi], si.Sbs[nowi+1:]...)
+					continue
+				// Lost
+				case 410:
+					i++
+					continue
+				default:
+					return nil, err
+				}
+			} else {
+				break
+			}
+		}
+		if sbsLen != len(si.Sbs) {
+			err = fs.Put(ctx, key, si.Bytes())
+			if err != nil {
+				return nil, err
+			}
+		}
+		if ret == nil {
+			return nil, datastore.ErrNotFound
+		} else {
+			return ret, nil
+		}
+	}
+
 	return data, nil
 }
 
@@ -684,20 +779,18 @@ func (fs *Datastore) Has(ctx context.Context, key datastore.Key) (exists bool, e
 }
 
 func (fs *Datastore) GetSize(ctx context.Context, key datastore.Key) (size int, err error) {
-	// Can't exist in datastore.
-	if !keyIsValid(key) {
-		return -1, datastore.ErrNotFound
-	}
-
-	_, path := fs.encode(key)
-	switch s, err := os.Stat(path); {
-	case err == nil:
-		return int(s.Size()), nil
-	case os.IsNotExist(err):
-		return -1, datastore.ErrNotFound
-	default:
+	value, err := fs.GetRaw(key)
+	if err != nil {
 		return -1, err
 	}
+
+	if ok, si := crust.TryGetSealedInfo(value); ok {
+		if len(si.Sbs) == 0 {
+			return -1, datastore.ErrNotFound
+		}
+		return si.Sbs[0].Size, nil
+	}
+	return len(value), nil
 }
 
 // Delete removes a key/value from the Datastore. Please read
